@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Licznik kalorii (Gemini)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#F6F7F5; --ink:#1C2321; --muted:#66716B; --card:#FFF; --line:#E2E6E1;
+    --green:#2F6B4F; --green-soft:#E7F0EB; --red:#B3402A; --red-soft:#F7E9E5;
+    --amber:#8A6D1F;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:system-ui,-apple-system,sans-serif;font-size:15px}
+  .wrap{max-width:560px;margin:0 auto;padding:20px 14px 60px}
+  h1{font-size:20px;margin:0}
+  .header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px}
+  .limit-badge{font-size:13px;color:var(--muted);font-family:ui-monospace,Menlo,monospace}
+  .tabs{display:flex;gap:6px;margin-bottom:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:14px}
+  .card.soft{background:var(--green-soft);border:none}
+  .card.warn{background:var(--red-soft);border:none}
+  button{padding:10px 16px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;
+    border:1px solid var(--line);background:var(--card);color:var(--ink)}
+  button.primary{background:var(--green);color:#fff;border:none}
+  button.danger{color:var(--red)}
+  button.small{padding:5px 9px;font-size:12px}
+  button:disabled{opacity:.5;cursor:default}
+  .row{display:flex;gap:8px}
+  .row>button{flex:1}
+  input,select,textarea{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--line);
+    font-size:15px;background:#fff;color:var(--ink);font-family:inherit}
+  textarea{min-height:60px;resize:vertical}
+  label{display:block;margin-bottom:14px}
+  .lbl{font-size:13px;color:var(--muted);margin-bottom:5px}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px}
+  .err{color:var(--red);font-size:13px;margin-top:8px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+  .receipt{font-family:ui-monospace,Menlo,monospace;font-size:14px;background:#FCFDFB}
+  .receipt .rrow{display:flex;justify-content:space-between;padding:4px 0}
+  .receipt .rrow.b{font-weight:700}
+  .receipt .sep{border-top:1px dashed var(--line);margin:6px 0;padding-top:6px}
+  .receipt .last{padding-bottom:8px;margin-bottom:8px;border-bottom:1px dashed var(--line)}
+  .over{color:var(--red);font-weight:700}
+  .entry{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line);font-size:14px}
+  .entry .name{flex:1}
+  .pill{font-size:12px;font-weight:700;padding:3px 8px;border-radius:20px}
+  .pill.ok{background:var(--green-soft);color:var(--green)}
+  .pill.bad{background:var(--red-soft);color:var(--red)}
+  table{width:100%;font-size:13px;border-collapse:collapse}
+  th{color:var(--muted);text-align:left;padding:6px}
+  td{padding:6px;border-top:1px solid var(--line)}
+  .skl{margin-top:10px;font-size:13px;font-family:ui-monospace,Menlo,monospace;color:var(--muted)}
+  .skl div{display:flex;justify-content:space-between;padding:2px 0}
+  .chartbox{height:230px;position:relative}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<script>
+/* ============================================================
+   Licznik kalorii — wersja samodzielna (www / plik lokalny)
+   Dane: localStorage. AI: Gemini API (Google) z własnym kluczem.
+   ============================================================ */
+const KEY = "kcal-app-v1";
+const $ = (id) => document.getElementById(id);
+const todayStr = () => {
+  const d = new Date();
+  return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+};
+const emptyDay = () => ({ date: todayStr(), entries: [] });
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+/* ---------- stan ---------- */
+let S = null;            // {profile, currentDay, history, measurements, apiKey}
+let view = "dzisiaj";
+let pending = null;      // {nazwa,kcal,typ,pewnosc,skladniki}
+let busy = false;
+let lastErr = "";
+let lastEntryId = null;
+let editId = null;
+let metric = "waga";
+let chartRef = null;
+
+function load(){ try{ const r = localStorage.getItem(KEY); return r ? JSON.parse(r) : null; }catch{ return null; } }
+function save(){ try{ localStorage.setItem(KEY, JSON.stringify(S)); }catch(e){ console.error(e); } }
+
+/* ---------- logika ---------- */
+function bmi(w,h){ const m=h/100; return w&&h ? w/(m*m) : 0; }
+function bmiLabel(v){ return v<18.5?"niedowaga":v<25?"norma":v<30?"nadwaga":"otyłość"; }
+function normRange(h){ const m=h/100; return [Math.round(18.5*m*m), Math.round(24.9*m*m)]; }
+function suggestLimit(p){
+  if(!p.waga||!p.wzrost||!p.wiek) return null;
+  const bmr = 10*p.waga + 6.25*p.wzrost - 5*p.wiek + (p.plec==="mężczyzna"?5:-161);
+  const tdee = bmr * (p.aktywnosc||1.2);
+  const def = p.wagaDocelowa && p.wagaDocelowa < p.waga ? 400 : 0;
+  return Math.round((tdee-def)/50)*50;
+}
+function sums(entries){
+  const zj = entries.filter(e=>e.typ==="posiłek").reduce((a,e)=>a+e.kcal,0);
+  const sp = entries.filter(e=>e.typ==="trening").reduce((a,e)=>a+e.kcal,0);
+  return { zjedzone:zj, spalone:sp, netto:zj-sp };
+}
+function parseManual(text){
+  const m = text.trim().match(/^(.*?)[\s,]*(\d+)\s*(kcal)?$/i);
+  if(!m) return null;
+  return { nazwa: m[1].trim() || "Wpis", kcal: parseInt(m[2],10), pewnosc:"wysoka" };
+}
+function closeDay(saveHist){
+  const d = S.currentDay;
+  if(saveHist && d.entries.length>0){
+    S.history.push({ date:d.date, ...sums(d.entries), limit:S.profile.limit });
+  }
+  S.currentDay = emptyDay();
+  lastEntryId = null; pending = null;
+  save();
+}
+
+/* ---------- AI (Gemini) ---------- */
+const MEAL_RULES = `Zasady szacowania:
+1. Rozbij opis na pojedyncze składniki i oszacuj każdy osobno, potem zsumuj.
+2. Przeliczaj polskie miary domowe na gramy/mililitry, przyjmuj typowe wartości:
+   szklanka = 250 ml, łyżka płatków/kaszy = ok. 10 g, łyżka cukru/miodu = ok. 20 g,
+   łyżka oleju/masła = ok. 12 g, łyżeczka = 1/3 łyżki, kromka chleba = ok. 35 g,
+   garść orzechów = ok. 30 g, plaster sera/wędliny = ok. 20 g, jajko M = ok. 55 g.
+3. Jeśli użytkownik nie podał ilości, przyjmij typową polską porcję i obniż pewność do "średnia".
+4. Jeśli nie znasz produktu, przyjmij najbliższy odpowiednik i pewność "niska". Nigdy nie odmawiaj szacunku.
+5. Zawsze podaj konkretną liczbę kcal większą od zera, chyba że wpis ewidentnie nie jest jedzeniem.
+
+Odpowiedz WYŁĄCZNIE poprawnym JSON, bez tekstu przed ani po, w formacie:
+{"nazwa":"krótka nazwa całego posiłku po polsku","skladniki":[{"nazwa":"składnik","ilosc":"np. 250 ml","kcal":liczba}],"kcal":suma_liczba_calkowita,"typ":"posiłek","pewnosc":"wysoka" lub "średnia" lub "niska"}`;
+
+/* Model: aliasy "-latest" zawsze wskazują aktualny, żywy model — konkretne wersje
+   (1.5, 2.0, 2.5...) Google regularnie wyłącza i wtedy API zwraca 404.
+   Główny: Flash-Lite (najtańszy, wystarcza do szacowania posiłków).
+   Zapasowy: pełny Flash, gdyby Lite był chwilowo przeciążony. */
+const GEMINI_MODEL = "gemini-flash-lite-latest";
+const GEMINI_FALLBACK = "gemini-flash-latest";
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function geminiRequest(model, parts){
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const res = await fetch(url, {
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      "x-goog-api-key": S.apiKey  // klucz w nagłówku, nie w URL — adresy trafiają do logów
+    },
+    body: JSON.stringify({
+      contents: [{ parts: parts }],
+      generationConfig: {
+        responseMimeType: "application/json" // Wymusza czysty JSON na wyjściu
+      }
+    })
+  });
+  const data = await res.json();
+  console.log("Odpowiedź API ("+model+", status "+res.status+"):", JSON.stringify(data).slice(0,800));
+  if(data.error){
+    const err = new Error((data.error.message||"Błąd API")+" [HTTP "+res.status+"]");
+    err.status = res.status;
+    throw err;
+  }
+  if(!res.ok){ const err = new Error("HTTP "+res.status); err.status = res.status; throw err; }
+  if(!data.candidates || !data.candidates[0].content) throw new Error("Pusta odpowiedź od modelu");
+  return data.candidates[0].content.parts[0].text;
+}
+
+async function callAI(parts){
+  if(!S.apiKey) throw new Error("Brak klucza API — wklej go w zakładce Ustawienia");
+
+  /* Plan: 3 próby na modelu głównym z odczekaniem (503/429 to chwilowe przeciążenie),
+     potem 1 próba na modelu zapasowym. Inne błędy (zły klucz, 404) nie są ponawiane. */
+  const plan = [
+    { model: GEMINI_MODEL, wait: 0 },
+    { model: GEMINI_MODEL, wait: 1500 },
+    { model: GEMINI_MODEL, wait: 3000 },
+    { model: GEMINI_FALLBACK, wait: 500 },
+  ];
+  let text = null, lastError = null;
+  for(const step of plan){
+    if(step.wait) await sleep(step.wait);
+    try{
+      text = await geminiRequest(step.model, parts);
+      break;
+    }catch(e){
+      lastError = e;
+      const retryable = e.status===503 || e.status===429 || /high demand|overloaded|try again/i.test(e.message||"");
+      if(!retryable) throw e;
+    }
+  }
+  if(text===null) throw new Error("Serwery Google są chwilowo przeciążone (próbowałem 4 razy, także na modelu zapasowym). Odczekaj minutę i spróbuj ponownie, albo wpisz kcal ręcznie. ["+(lastError&&lastError.message||"")+"]");
+
+  const p = JSON.parse(text);
+
+  if(typeof p.kcal!=="number") p.kcal = parseInt(p.kcal,10)||0;
+  if(Array.isArray(p.skladniki) && p.skladniki.length){
+    const suma = p.skladniki.reduce((a,s)=>a+(Number(s.kcal)||0),0);
+    if(suma>0) p.kcal = Math.round(suma);
+  }
+  return p;
+}
+
+function mealTextPrompt(t){ 
+    return [{ text: `Oszacuj kaloryczność posiłku opisanego przez użytkownika: "${t}".\n\n${MEAL_RULES}` }]; 
+}
+
+function mealPhotoPrompt(b64, mt, note){
+  return [
+    { text: `Rozpoznaj, co jest na zdjęciu posiłku${note?` (podpowiedź użytkownika: "${note}")`:""} i oszacuj kaloryczność. Oceń wielkość porcji po proporcjach na zdjęciu (talerz ma zwykle 24-26 cm średnicy).\n\n${MEAL_RULES}` },
+    { inlineData: { mimeType: mt, data: b64 } }
+  ];
+}
+
+function trainingPrompt(t,p){
+  return [{ text: `Oszacuj kalorie spalone podczas aktywności: "${t}". Profil: płeć ${p.plec}, waga ${p.waga} kg, wzrost ${p.wzrost} cm. Odpowiedz WYŁĄCZNIE poprawnym JSON: {"nazwa":"krótka nazwa","kcal":liczba_calkowita,"typ":"trening","pewnosc":"wysoka" lub "średnia" lub "niska"}` }];
+}
+
+/* ---------- obraz ---------- */
+async function prepareImage(file, MAX=1000, Q=0.8){
+  let w=0,h=0,src=null,url=null;
+  try{
+    if(typeof createImageBitmap==="function"){
+      try{ src = await createImageBitmap(file); w=src.width; h=src.height; }catch{ src=null; }
+    }
+    if(!src){
+      url = URL.createObjectURL(file);
+      src = await new Promise((res,rej)=>{ const i=new Image(); i.onload=()=>res(i); i.onerror=()=>rej(new Error("decode")); i.src=url; });
+      w = src.naturalWidth||src.width; h = src.naturalHeight||src.height;
+    }
+    if(!w||!h) throw new Error("decode");
+    const sc = Math.min(1, MAX/Math.max(w,h));
+    const c = document.createElement("canvas");
+    c.width=Math.max(1,Math.round(w*sc)); c.height=Math.max(1,Math.round(h*sc));
+    c.getContext("2d").drawImage(src,0,0,c.width,c.height);
+    const b64 = (c.toDataURL("image/jpeg",Q).split(",")[1]||"").trim();
+    if(b64.length<2000) throw new Error("decode");
+    return { base64:b64, mediaType:"image/jpeg", kb:Math.round(b64.length*3/4096) };
+  } finally { if(url) URL.revokeObjectURL(url); }
+}
+function fileToBase64(f){
+  return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res((r.result.split(",")[1]||"").trim()); r.onerror=()=>rej(new Error("read")); r.readAsDataURL(f); });
+}
+
+/* ---------- akcje ---------- */
+async function estimate(){
+  const ta = $("inp"); const typ = $("t-posilek").classList.contains("primary") ? "posiłek" : "trening";
+  const text = ta.value.trim();
+  if(!text || busy) return;
+  lastErr = "";
+  const man = parseManual(text);
+  if(man){ pending = {...man, typ}; ta.value=""; render(); return; }
+  busy = true; render();
+  try{
+    const r = await callAI(typ==="trening" ? trainingPrompt(text,S.profile) : mealTextPrompt(text));
+    pending = { nazwa:r.nazwa, kcal:r.kcal, typ, pewnosc:r.pewnosc||"średnia", skladniki:r.skladniki };
+    ta.value="";
+  }catch(e){ lastErr = "Nie udało się oszacować: "+(e.message||"błąd")+". Spróbuj ponownie albo wpisz liczbę ręcznie (np. \"obiad 650\")."; }
+  busy = false; render();
+}
+async function onPhoto(ev){
+  const file = ev.target.files && ev.target.files[0];
+  if(!file || busy) return;
+  lastErr=""; busy=true; render();
+  let sizeInfo="";
+  const note = $("inp") ? $("inp").value.trim() : "";
+  try{
+    let img;
+    try{ img = await prepareImage(file); sizeInfo=` (wysłano ${img.kb} kB JPEG)`; }
+    catch{
+      if(file.size > 4.5*1024*1024) throw new Error(`Nie mogę skompresować zdjęcia, a oryginał ma ${(file.size/1024/1024).toFixed(1)} MB — za dużo dla API`);
+      img = { base64: await fileToBase64(file), mediaType: file.type||"image/jpeg" };
+      sizeInfo=` (wysłano oryginał ${Math.round(file.size/1024)} kB)`;
+    }
+    let r;
+    try{ r = await callAI(mealPhotoPrompt(img.base64,img.mediaType,note)); }
+    catch(e1){
+      try{
+        const small = await prepareImage(file,600,0.6);
+        sizeInfo=` (2. próba: ${small.kb} kB JPEG)`;
+        r = await callAI(mealPhotoPrompt(small.base64,small.mediaType,note));
+      }catch{ throw e1; }
+    }
+    pending = { nazwa:r.nazwa, kcal:r.kcal, typ:"posiłek", pewnosc:r.pewnosc||"średnia", skladniki:r.skladniki };
+    if($("inp")) $("inp").value="";
+  }catch(e){
+    lastErr = "Nie udało się przetworzyć zdjęcia: "+(e.message||"błąd")+sizeInfo+". Opisz posiłek tekstem albo wpisz kcal ręcznie.";
+  }
+  busy=false; ev.target.value=""; render();
+}
+function savePending(){
+  const kcal = Number($("p-kcal").value)||0;
+  const nazwa = $("p-nazwa").value.trim()||"Wpis";
+  const e = { id:Date.now(), nazwa, kcal, typ:pending.typ };
+  S.currentDay.entries.push(e);
+  lastEntryId = e.id; pending = null;
+  save(); render();
+}
+function removeEntry(id){
+  S.currentDay.entries = S.currentDay.entries.filter(e=>e.id!==id);
+  if(lastEntryId===id) lastEntryId=null;
+  save(); render();
+}
+function saveEdit(id){
+  const v = Number($("edit-"+id).value);
+  if(!Number.isFinite(v)) return;
+  const e = S.currentDay.entries.find(e=>e.id===id);
+  if(e) e.kcal = v;
+  editId = null; save(); render();
+}
+function addMeasurement(){
+  const m = { date: todayStr() };
+  let any=false;
+  ["waga","biodra","brzuch","biceps"].forEach(k=>{
+    const v = Number($("m-"+k).value);
+    if($("m-"+k).value!=="" && Number.isFinite(v)){ m[k]=v; any=true; }
+  });
+  if(!any) return;
+  S.measurements.push(m);
+  save(); render();
+}
+
+/* ---------- widoki ---------- */
+const METRICS = [["waga","Waga (kg)"],["biodra","Biodra (cm)"],["brzuch","Brzuch (cm)"],["biceps","Biceps (cm)"]];
+
+function receiptHTML(){
+  const {zjedzone,spalone,netto} = sums(S.currentDay.entries);
+  const limit = S.profile.limit;
+  const zostalo = limit-netto;
+  const last = S.currentDay.entries.find(e=>e.id===lastEntryId);
+  return `<div class="card receipt">
+    ${last?`<div class="last">🟢 Wpis: ${esc(last.nazwa)} (${last.typ==="trening"?"−":"+"}${last.kcal} kcal)</div>`:""}
+    <div style="font-weight:700;margin-bottom:6px">📊 BIEŻĄCY BILANS (NETTO)</div>
+    <div class="rrow"><span>Zjedzone</span><span>${zjedzone} kcal</span></div>
+    <div class="rrow"><span>Spalone (ćwiczenia)</span><span>${spalone} kcal</span></div>
+    <div class="rrow"><span>Wynik netto</span><span>${netto} / ${limit} kcal</span></div>
+    <div class="sep">${zostalo<0
+      ?`<div class="over">PRZEKROCZONO LIMIT o ${Math.abs(zostalo)} kcal</div>`
+      :`<div class="rrow b"><span>POZOSTAŁO DO LIMITU</span><span>${zostalo} kcal</span></div>`}</div>
+  </div>`;
+}
+
+function todayHTML(){
+  const typPosilek = !window._typTrening;
+  let h = receiptHTML();
+  h += `<div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <button id="t-posilek" class="${typPosilek?"primary":""}" onclick="window._typTrening=false;render()">🍽 Posiłek (+kcal)</button>
+      <button id="t-trening" class="${!typPosilek?"primary":""}" onclick="window._typTrening=true;render()">🏃 Trening (−kcal)</button>
+    </div>
+    <textarea id="inp" placeholder='${typPosilek?"np. &quot;4 gofry z bitą śmietaną&quot; albo &quot;napój białkowy 150&quot;":"np. &quot;rower 45 min&quot; albo &quot;trening 700&quot;"}'>${esc(window._draft||"")}</textarea>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" onclick="estimate()" ${busy?"disabled":""}>${busy?"Szacuję…":"Dodaj wpis"}</button>
+      ${typPosilek?`<button onclick="document.getElementById('photo').click()" ${busy?"disabled":""} style="flex:0 0 auto">📷 Zdjęcie</button>`:""}
+    </div>
+    <input type="file" id="photo" accept="image/*" style="display:none" onchange="onPhoto(event)">
+    <div class="hint">Wskazówka: wpis zakończony liczbą (np. „obiad 650") zapisuje się bez pytania AI.</div>
+    ${lastErr?`<div class="err">${esc(lastErr)}</div>`:""}
+  </div>`;
+  if(pending){
+    h += `<div class="card" style="border-color:var(--green)">
+      <div class="lbl">Szacunek do akceptacji ${pending.pewnosc==="niska"?'<span style="color:var(--amber)">(niska pewność — zgrubny szacunek)</span>':""}</div>
+      <div class="row" style="align-items:center">
+        <input id="p-nazwa" value="${esc(pending.nazwa)}" style="flex:2">
+        <input id="p-kcal" type="number" value="${pending.kcal}" style="flex:0 0 100px">
+        <span class="lbl" style="margin:0">kcal</span>
+      </div>
+      ${Array.isArray(pending.skladniki)&&pending.skladniki.length?`<div class="skl">${pending.skladniki.map(s=>`<div><span>${esc(s.nazwa)}${s.ilosc?` (${esc(s.ilosc)})`:""}</span><span>${s.kcal} kcal</span></div>`).join("")}</div>`:""}
+      <div class="row" style="margin-top:10px">
+        <button class="primary" onclick="savePending()">Zapisz</button>
+        <button onclick="pending=null;render()" style="flex:0 0 auto">Anuluj</button>
+      </div>
+    </div>`;
+  }
+  h += `<div class="card">
+    <div style="font-weight:700;margin-bottom:8px">Wpisy — ${S.currentDay.date}</div>
+    ${S.currentDay.entries.length===0?'<div class="hint" style="font-size:14px">Brak wpisów. Dodaj pierwszy posiłek albo trening.</div>':""}
+    ${S.currentDay.entries.map(e=>`<div class="entry">
+      <span class="name">${e.typ==="trening"?"🏃":"🍽"} ${esc(e.nazwa)}</span>
+      ${editId===e.id
+        ?`<input id="edit-${e.id}" type="number" value="${e.kcal}" style="width:90px;padding:6px 8px"><button class="primary small" onclick="saveEdit(${e.id})">OK</button>`
+        :`<span class="mono" style="color:${e.typ==="trening"?"var(--green)":"inherit"}">${e.typ==="trening"?"−":"+"}${e.kcal} kcal</span>
+          <button class="small" onclick="editId=${e.id};render()">edytuj</button>
+          <button class="small danger" onclick="removeEntry(${e.id})">usuń</button>`}
+    </div>`).join("")}
+    <div class="row" style="margin-top:14px">
+      <button class="primary" onclick="closeDay(true);render()">Nowy dzień (zapisz do historii)</button>
+      <button class="danger" style="flex:0 0 auto" onclick="if(confirm('Wyzerować bieżący dzień bez zapisu?')){closeDay(false);render()}">Reset</button>
+    </div>
+  </div>`;
+  return h;
+}
+
+function measurementsHTML(){
+  const list = S.measurements;
+  const last = list[list.length-1];
+  const first = list[0];
+  const fmt = v => (v>0?"+":"")+v.toFixed(1);
+  let h = `<div class="card">
+    <div style="font-weight:700;margin-bottom:10px">Nowy pomiar (${todayStr()})</div>
+    <div class="grid2">
+      ${METRICS.map(([k,l])=>`<label><div class="lbl">${l}</div><input id="m-${k}" type="number"></label>`).join("")}
+    </div>
+    <button class="primary" style="width:100%" onclick="addMeasurement()">Zapisz pomiar</button>
+    <div class="hint">Sugerowana częstotliwość: raz w tygodniu.</div>
+  </div>`;
+  if(last){
+    h += `<div class="card soft"><div style="font-weight:700;margin-bottom:6px">Ostatni pomiar: ${last.date}</div>`;
+    METRICS.forEach(([k,l])=>{
+      if(last[k]==null) return;
+      const prev = list[list.length-2];
+      const d1 = prev&&prev[k]!=null ? last[k]-prev[k] : null;
+      const d0 = first&&first[k]!=null&&first!==last ? last[k]-first[k] : null;
+      h += `<div style="font-size:14px;padding:2px 0">${l}: <b>${last[k]}</b>${d1!=null?` (${fmt(d1)} od poprzedniego)`:""}${d0!=null?`, ${fmt(d0)} od startu`:""}</div>`;
+    });
+    if(last.waga!=null && S.profile.wzrost){
+      const bNow = bmi(last.waga,S.profile.wzrost);
+      const fw = list.find(m=>m.waga!=null);
+      const bStart = fw&&fw!==last ? bmi(fw.waga,S.profile.wzrost) : null;
+      h += `<div style="font-size:14px;padding:6px 0 2px;margin-top:4px;border-top:1px solid rgba(0,0,0,.08)">BMI: <b>${bNow.toFixed(1)}</b> (${bmiLabel(bNow)})${bStart!=null?`, ${fmt(bNow-bStart)} od startu`:""}</div>`;
+    }
+    h += `</div>`;
+  }
+  h += `<div class="card">
+    <div class="row" style="flex-wrap:wrap;margin-bottom:10px">
+      ${[...METRICS,["bmi","BMI"]].map(([k,l])=>`<button class="small ${metric===k?"primary":""}" style="flex:0 0 auto" onclick="metric='${k}';render()">${l}</button>`).join("")}
+    </div>
+    <div class="chartbox"><canvas id="chart"></canvas></div>
+  </div>`;
+  if(list.length){
+    h += `<div class="card"><div style="font-weight:700;margin-bottom:8px">Wszystkie pomiary</div>
+    <div style="overflow-x:auto"><table><thead><tr><th>Data</th>${METRICS.map(([k,l])=>`<th>${l}</th>`).join("")}</tr></thead>
+    <tbody>${[...list].reverse().map(m=>`<tr><td>${m.date}</td>${METRICS.map(([k])=>`<td class="mono">${m[k]??"—"}</td>`).join("")}</tr>`).join("")}</tbody></table></div></div>`;
+  }
+  return h;
+}
+function drawChart(){
+  const cv = $("chart");
+  if(!cv || typeof Chart==="undefined") return;
+  const list = S.measurements;
+  const data = metric==="bmi"
+    ? list.filter(m=>m.waga!=null).map(m=>({x:m.date.slice(5), y:Number(bmi(m.waga,S.profile.wzrost).toFixed(1))}))
+    : list.filter(m=>m[metric]!=null).map(m=>({x:m.date.slice(5), y:m[metric]}));
+  if(chartRef) chartRef.destroy();
+  chartRef = new Chart(cv,{ type:"line",
+    data:{ labels:data.map(d=>d.x), datasets:[{ data:data.map(d=>d.y), borderColor:"#2F6B4F", backgroundColor:"#2F6B4F", tension:.3, pointRadius:3 }] },
+    options:{ responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{y:{beginAtZero:false}} }
+  });
+}
+
+function historyHTML(){
+  const hist = [...S.history].sort((a,b)=>a.date<b.date?1:-1);
+  const last7 = hist.slice(0,7);
+  const avg = last7.length ? Math.round(last7.reduce((a,d)=>a+d.netto,0)/last7.length) : null;
+  const limit = S.profile.limit;
+  let h = `<div class="card ${avg!=null&&avg>limit?"warn":"soft"}">
+    <div style="font-weight:700;margin-bottom:4px">Tydzień</div>
+    ${avg!=null
+      ?`<div style="font-size:14px">Średnie netto z ostatnich ${last7.length} dni: <b class="mono">${avg} kcal</b> przy limicie ${limit} kcal (${avg<=limit?`${limit-avg} kcal zapasu`:`${avg-limit} kcal ponad limit`}).</div>`
+      :'<div class="hint" style="font-size:14px">Zamknij pierwszy dzień, a pojawi się tu widok tygodniowy.</div>'}
+  </div>
+  <div class="card"><div style="font-weight:700;margin-bottom:8px">Zamknięte dni</div>
+  ${hist.length===0?'<div class="hint" style="font-size:14px">Historia jest pusta.</div>':""}
+  ${hist.map(d=>{ const ok=d.netto<=d.limit; return `<div class="entry">
+    <span style="width:86px">${d.date}</span>
+    <span class="mono" style="flex:1">${d.zjedzone} − ${d.spalone} = <b>${d.netto}</b> / ${d.limit}</span>
+    <span class="pill ${ok?"ok":"bad"}">${ok?"w limicie":"+"+(d.netto-d.limit)}</span>
+  </div>`;}).join("")}</div>`;
+  return h;
+}
+
+function profileFormHTML(mode){
+  const p = mode==="edit"
+    ? (window._edit || (window._edit = {...S.profile}))
+    : (window._onb || (window._onb = {plec:"mężczyzna",aktywnosc:1.2}));
+  const b = bmi(Number(p.waga),Number(p.wzrost));
+  const [lo,hi] = p.wzrost ? normRange(Number(p.wzrost)) : [0,0];
+  const sug = suggestLimit({...p, waga:Number(p.waga), wzrost:Number(p.wzrost), wiek:Number(p.wiek), wagaDocelowa:Number(p.wagaDocelowa)});
+  return `
+    <label><div class="lbl">Płeć</div><div class="row">
+      ${["mężczyzna","kobieta"].map(g=>`<button class="${p.plec===g?"primary":""}" onclick="setProf('plec','${g}','${mode}')">${g}</button>`).join("")}
+    </div></label>
+    <div class="grid3">
+      <label><div class="lbl">Wzrost (cm)</div><input type="number" value="${p.wzrost??""}" onchange="setProf('wzrost',this.value,'${mode}')"></label>
+      <label><div class="lbl">Waga (kg)</div><input type="number" value="${p.waga??""}" onchange="setProf('waga',this.value,'${mode}')"></label>
+      <label><div class="lbl">Wiek</div><input type="number" value="${p.wiek??""}" onchange="setProf('wiek',this.value,'${mode}')"></label>
+    </div>
+    ${b>0?`<div class="card soft" style="font-size:14px">Twoje BMI: <b>${b.toFixed(1)}</b> (${bmiLabel(b)}).<br>Dla Twojego wzrostu waga w normie to <b>${lo}–${hi} kg</b>.</div>`:""}
+    <label><div class="lbl">Waga docelowa (kg)</div><input type="number" value="${p.wagaDocelowa??""}" onchange="setProf('wagaDocelowa',this.value,'${mode}')"></label>
+    <label><div class="lbl">Poziom aktywności (bez treningów — te logujesz w aplikacji)</div>
+      <select onchange="setProf('aktywnosc',this.value,'${mode}')">
+        <option value="1.2" ${p.aktywnosc==1.2?"selected":""}>siedzący — loguję treningi w aplikacji (zalecane)</option>
+        <option value="1.375" ${p.aktywnosc==1.375?"selected":""}>lekki (1–3 treningi/tydz. wliczone w limit)</option>
+        <option value="1.55" ${p.aktywnosc==1.55?"selected":""}>umiarkowany (3–5 wliczone w limit)</option>
+        <option value="1.725" ${p.aktywnosc==1.725?"selected":""}>wysoki (6–7 wliczone w limit)</option>
+      </select>
+      <div class="hint">Poziom wyższy niż „siedzący" wlicza treningi w limit. Logując je dodatkowo jako wpisy, policzysz je podwójnie.</div>
+    </label>
+    ${mode!=="edit"?`<div class="lbl">Pomiary startowe (cm)</div><div class="grid3">
+      <label><div class="lbl">Biodra</div><input type="number" id="onb-biodra"></label>
+      <label><div class="lbl">Brzuch (pas)</div><input type="number" id="onb-brzuch"></label>
+      <label><div class="lbl">Biceps</div><input type="number" id="onb-biceps"></label>
+    </div>`:""}
+    <label><div class="lbl">Dzienny limit kaloryczny${sug?` (propozycja: ${sug} kcal — Mifflin-St Jeor${Number(p.wagaDocelowa)<Number(p.waga)?" z deficytem ~400 kcal":""})`:""}</div>
+      <input type="number" id="prof-limit" value="${window._limitDraft ?? p.limit ?? sug ?? ""}" oninput="window._limitTouched=true;window._limitDraft=this.value"></label>
+    ${mode==="edit"?'<div class="hint" style="margin-bottom:12px">Zmiana limitu działa od bieżącego dnia. Historia zostaje bez zmian.</div>':""}
+    <label><div class="lbl">Klucz API Gemini (aistudio.google.com → Get API key)</div>
+      <input type="password" id="prof-key" value="${esc(S&&S.apiKey||"")}" placeholder="AIza..."></label>
+    <button class="primary" style="width:100%" onclick="saveProfile('${mode}')">${mode==="edit"?"Zapisz zmiany":"Zaczynamy"}</button>`;
+}
+function setProf(k,v,mode){
+  const t = mode==="edit" ? window._edit : window._onb;
+  t[k] = (k==="plec") ? v : (v===""?"":Number(v));
+  if(!window._limitTouched){
+    const q = suggestLimit({...t, waga:Number(t.waga), wzrost:Number(t.wzrost), wiek:Number(t.wiek), wagaDocelowa:Number(t.wagaDocelowa)});
+    if(q) window._limitDraft = q;
+  }
+  render();
+}
+function saveProfile(mode){
+  const t = mode==="edit" ? window._edit : window._onb;
+  const limit = Number($("prof-limit").value);
+  const key = $("prof-key").value.trim();
+  if(!t.wzrost||!t.waga||!t.wiek||!limit){ alert("Uzupełnij wzrost, wagę, wiek i limit."); return; }
+  if(mode==="edit"){
+    S.profile = {...S.profile, ...t, limit};
+    S.apiKey = key;
+    window._edit = null;
+  } else {
+    const m = { date: todayStr(), waga:Number(t.waga) };
+    ["biodra","brzuch","biceps"].forEach(k=>{
+      const v = Number($("onb-"+k).value);
+      if($("onb-"+k).value!=="" && Number.isFinite(v)) m[k]=v;
+    });
+    S = { profile:{...t, limit}, apiKey:key, currentDay:emptyDay(), history:[], measurements:[m] };
+    window._onb = null;
+  }
+  window._limitDraft = null; window._limitTouched = false;
+  save(); view="dzisiaj"; render();
+}
+
+/* ---------- render ---------- */
+function render(){
+  const app = $("app");
+  const inp = $("inp"); if(inp) window._draft = inp.value;
+  if(!S || !S.profile){
+    app.innerHTML = `<h1 style="margin-bottom:2px">Licznik kalorii</h1>
+      <p class="hint" style="font-size:14px;margin-top:0">Kilka pytań na start. Wszystko zmienisz później w ustawieniach.</p>
+      <div class="card">${profileFormHTML("onboarding")}</div>`;
+    return;
+  }
+  const tabs = [["dzisiaj","Dzisiaj"],["pomiary","Pomiary"],["historia","Historia"],["ustawienia","Ustawienia"]];
+  if(view!=="ustawienia"){ window._edit=null; window._limitDraft=null; window._limitTouched=false; }
+  let body = "";
+  if(view==="dzisiaj") body = todayHTML();
+  else if(view==="pomiary") body = measurementsHTML();
+  else if(view==="historia") body = historyHTML();
+  else body = `<div class="card"><div style="font-weight:700;margin-bottom:12px">Edycja profilu</div>${profileFormHTML("edit")}</div>`;
+  app.innerHTML = `
+    <div class="header"><h1>Licznik kalorii</h1><span class="limit-badge">limit ${S.profile.limit} kcal</span></div>
+    <div class="tabs">${tabs.map(([k,l])=>`<button class="${view===k?"primary":""}" style="flex:1;padding:8px 4px;font-size:13px" onclick="view='${k}';render()">${l}</button>`).join("")}</div>
+    ${body}`;
+  if(view==="pomiary") drawChart();
+  const inp2 = $("inp"); if(inp2 && window._draft) inp2.value = window._draft;
+}
+
+/* ---------- start ---------- */
+(function init(){
+  S = load();
+  if(S && S.currentDay && S.currentDay.date !== todayStr()){
+    const d = S.currentDay;
+    if(d.entries.length>0) S.history.push({ date:d.date, ...sums(d.entries), limit:S.profile.limit });
+    S.currentDay = emptyDay();
+    save();
+  }
+  render();
+})();
+</script>
+</body>
+</html>
