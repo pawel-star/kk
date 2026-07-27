@@ -134,39 +134,69 @@ const MEAL_RULES = `Zasady szacowania:
 Odpowiedz WYŁĄCZNIE poprawnym JSON, bez tekstu przed ani po, w formacie:
 {"nazwa":"krótka nazwa całego posiłku po polsku","skladniki":[{"nazwa":"składnik","ilosc":"np. 250 ml","kcal":liczba}],"kcal":suma_liczba_calkowita,"typ":"posiłek","pewnosc":"wysoka" lub "średnia" lub "niska"}`;
 
-/* Model: alias "gemini-flash-latest" zawsze wskazuje aktualny, żywy model Flash.
-   Konkretne wersje (1.5, 2.0...) Google regularnie wyłącza i wtedy API zwraca 404. */
-const GEMINI_MODEL = "gemini-flash-latest";
+/* Model: aliasy "-latest" zawsze wskazują aktualny, żywy model — konkretne wersje
+   (1.5, 2.0, 2.5...) Google regularnie wyłącza i wtedy API zwraca 404.
+   Główny: Flash-Lite (najtańszy, wystarcza do szacowania posiłków).
+   Zapasowy: pełny Flash, gdyby Lite był chwilowo przeciążony. */
+const GEMINI_MODEL = "gemini-flash-lite-latest";
+const GEMINI_FALLBACK = "gemini-flash-latest";
 
-async function callAI(parts){
-  if(!S.apiKey) throw new Error("Brak klucza API — wklej go w zakładce Ustawienia");
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-
+async function geminiRequest(model, parts){
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const res = await fetch(url, {
     method:"POST",
     headers:{
       "Content-Type":"application/json",
       "x-goog-api-key": S.apiKey  // klucz w nagłówku, nie w URL — adresy trafiają do logów
     },
-    body: JSON.stringify({ 
+    body: JSON.stringify({
       contents: [{ parts: parts }],
       generationConfig: {
         responseMimeType: "application/json" // Wymusza czysty JSON na wyjściu
       }
     })
   });
-  
   const data = await res.json();
-  console.log("Odpowiedź API (status "+res.status+"):", JSON.stringify(data).slice(0,800));
-  
-  if(data.error) throw new Error((data.error.message||"Błąd API")+" [HTTP "+res.status+"]");
-  if(!res.ok) throw new Error("HTTP "+res.status);
+  console.log("Odpowiedź API ("+model+", status "+res.status+"):", JSON.stringify(data).slice(0,800));
+  if(data.error){
+    const err = new Error((data.error.message||"Błąd API")+" [HTTP "+res.status+"]");
+    err.status = res.status;
+    throw err;
+  }
+  if(!res.ok){ const err = new Error("HTTP "+res.status); err.status = res.status; throw err; }
   if(!data.candidates || !data.candidates[0].content) throw new Error("Pusta odpowiedź od modelu");
+  return data.candidates[0].content.parts[0].text;
+}
 
-  const text = data.candidates[0].content.parts[0].text;
+async function callAI(parts){
+  if(!S.apiKey) throw new Error("Brak klucza API — wklej go w zakładce Ustawienia");
+
+  /* Plan: 3 próby na modelu głównym z odczekaniem (503/429 to chwilowe przeciążenie),
+     potem 1 próba na modelu zapasowym. Inne błędy (zły klucz, 404) nie są ponawiane. */
+  const plan = [
+    { model: GEMINI_MODEL, wait: 0 },
+    { model: GEMINI_MODEL, wait: 1500 },
+    { model: GEMINI_MODEL, wait: 3000 },
+    { model: GEMINI_FALLBACK, wait: 500 },
+  ];
+  let text = null, lastError = null;
+  for(const step of plan){
+    if(step.wait) await sleep(step.wait);
+    try{
+      text = await geminiRequest(step.model, parts);
+      break;
+    }catch(e){
+      lastError = e;
+      const retryable = e.status===503 || e.status===429 || /high demand|overloaded|try again/i.test(e.message||"");
+      if(!retryable) throw e;
+    }
+  }
+  if(text===null) throw new Error("Serwery Google są chwilowo przeciążone (próbowałem 4 razy, także na modelu zapasowym). Odczekaj minutę i spróbuj ponownie, albo wpisz kcal ręcznie. ["+(lastError&&lastError.message||"")+"]");
+
   const p = JSON.parse(text);
-  
+
   if(typeof p.kcal!=="number") p.kcal = parseInt(p.kcal,10)||0;
   if(Array.isArray(p.skladniki) && p.skladniki.length){
     const suma = p.skladniki.reduce((a,s)=>a+(Number(s.kcal)||0),0);
@@ -294,6 +324,62 @@ function addMeasurement(){
   save(); render();
 }
 
+/* ---------- propozycje posiłków ---------- */
+let proposals = null;      // [{nazwa,kcal,bialko,opis}]
+let propBusy = false;
+let propMode = null;       // "zwykly" | "potreningowy"
+
+function poraDnia(){
+  const h = new Date().getHours();
+  if(h<11) return "śniadanie";
+  if(h<15) return "obiad";
+  if(h<18) return "podwieczorek / lekki posiłek";
+  return "kolacja";
+}
+function proposalsPrompt(mode){
+  const p = S.profile;
+  const {netto} = sums(S.currentDay.entries);
+  const zostalo = Math.max(0, p.limit - netto);
+  const potrening = mode==="potreningowy";
+  return [{ text: `Zaproponuj dokładnie 3 różne posiłki dla osoby: ${p.plec}, ${p.wiek} lat, ${p.waga} kg, cel: redukcja wagi przy zachowaniu masy mięśniowej.
+
+Kontekst: pora dnia: ${poraDnia()}. Pozostało dziś do limitu: ${zostalo} kcal — każda propozycja musi się mieścić w tym budżecie z zapasem na resztę dnia.
+${potrening ? "SYTUACJA: posiłek POTRENINGOWY po siłowni — priorytetem jest białko: minimum 30-40 g pełnowartościowego białka w posiłku, dodaj też węglowodany na regenerację glikogenu." : "Osoba po 45. roku życia potrzebuje więcej białka: celuj w 25-35 g białka w posiłku."}
+
+Twarde zasady:
+1. Produkty łatwo dostępne w Polsce, proste przygotowanie (maks. 20 minut), realne porcje.
+2. Opieraj się na standardowych zaleceniach żywieniowych (dla osób 45+: białko 1,2-1,6 g/kg masy ciała dziennie). Żadnych modnych diet i suplementów.
+3. Trzy propozycje mają być RÓŻNORODNE (np. nie trzy wersje jajek) i takie, które większość ludzi lubi — klasyki, nie eksperymenty.
+4. Dla każdej podaj realną kaloryczność i gramy białka.
+
+Odpowiedz WYŁĄCZNIE poprawnym JSON, bez tekstu przed ani po:
+{"propozycje":[{"nazwa":"nazwa posiłku","opis":"krótki opis: składniki z ilościami, 1-2 zdania","kcal":liczba_calkowita,"bialko":liczba_gramy}]}` }];
+}
+async function suggestMeals(mode){
+  if(propBusy) return;
+  propMode = mode; propBusy = true; proposals = null; lastErr=""; render();
+  try{
+    const r = await callAI(proposalsPrompt(mode));
+    if(!Array.isArray(r.propozycje) || !r.propozycje.length) throw new Error("Brak propozycji w odpowiedzi");
+    proposals = r.propozycje.slice(0,3).map(x=>({
+      nazwa: String(x.nazwa||"Posiłek"),
+      opis: String(x.opis||""),
+      kcal: Number(x.kcal)||0,
+      bialko: Number(x.bialko)||0
+    }));
+  }catch(e){
+    lastErr = "Nie udało się pobrać propozycji: "+(e.message||"błąd")+". Spróbuj ponownie za chwilę.";
+  }
+  propBusy = false; render();
+}
+function chooseProposal(i){
+  const pr = proposals && proposals[i];
+  if(!pr) return;
+  pending = { nazwa: pr.nazwa, kcal: pr.kcal, typ:"posiłek", pewnosc:"średnia",
+    skladniki: pr.opis ? [{nazwa: pr.opis, ilosc:"", kcal: pr.kcal}] : null };
+  proposals = null; render();
+}
+
 /* ---------- widoki ---------- */
 const METRICS = [["waga","Waga (kg)"],["biodra","Biodra (cm)"],["brzuch","Brzuch (cm)"],["biceps","Biceps (cm)"]];
 
@@ -330,6 +416,27 @@ function todayHTML(){
     <input type="file" id="photo" accept="image/*" style="display:none" onchange="onPhoto(event)">
     <div class="hint">Wskazówka: wpis zakończony liczbą (np. „obiad 650") zapisuje się bez pytania AI.</div>
     ${lastErr?`<div class="err">${esc(lastErr)}</div>`:""}
+  </div>`;
+  h += `<div class="card">
+    <div style="font-weight:700;margin-bottom:8px">💡 Nie wiesz, co zjeść?</div>
+    <div class="row">
+      <button onclick="suggestMeals('zwykly')" ${propBusy?"disabled":""}>${propBusy&&propMode==='zwykly'?"Szukam…":"🍳 3 propozycje"}</button>
+      <button onclick="suggestMeals('potreningowy')" ${propBusy?"disabled":""}>${propBusy&&propMode==='potreningowy'?"Szukam…":"💪 Po treningu (białko)"}</button>
+    </div>
+    ${proposals?`<div style="margin-top:12px">${proposals.map((pr,i)=>`
+      <div style="padding:10px 0;border-top:1px solid var(--line)">
+        <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">
+          <b style="font-size:14px">${esc(pr.nazwa)}</b>
+          <span class="mono" style="font-size:13px;white-space:nowrap">${pr.kcal} kcal · ${pr.bialko} g białka</span>
+        </div>
+        <div class="hint" style="margin-top:3px">${esc(pr.opis)}</div>
+        <button class="small primary" style="margin-top:6px" onclick="chooseProposal(${i})">Wybieram ten</button>
+      </div>`).join("")}
+      <div class="row" style="margin-top:8px">
+        <button class="small" style="flex:0 0 auto" onclick="suggestMeals(propMode)">Inne propozycje</button>
+        <button class="small" style="flex:0 0 auto" onclick="proposals=null;render()">Zamknij</button>
+      </div>
+    </div>`:""}
   </div>`;
   if(pending){
     h += `<div class="card" style="border-color:var(--green)">
@@ -444,7 +551,9 @@ function historyHTML(){
 }
 
 function profileFormHTML(mode){
-  const p = mode==="edit" ? S.profile : (window._onb || (window._onb = {plec:"mężczyzna",aktywnosc:1.2}));
+  const p = mode==="edit"
+    ? (window._edit || (window._edit = {...S.profile}))
+    : (window._onb || (window._onb = {plec:"mężczyzna",aktywnosc:1.2}));
   const b = bmi(Number(p.waga),Number(p.wzrost));
   const [lo,hi] = p.wzrost ? normRange(Number(p.wzrost)) : [0,0];
   const sug = suggestLimit({...p, waga:Number(p.waga), wzrost:Number(p.wzrost), wiek:Number(p.wiek), wagaDocelowa:Number(p.wagaDocelowa)});
@@ -474,25 +583,30 @@ function profileFormHTML(mode){
       <label><div class="lbl">Biceps</div><input type="number" id="onb-biceps"></label>
     </div>`:""}
     <label><div class="lbl">Dzienny limit kaloryczny${sug?` (propozycja: ${sug} kcal — Mifflin-St Jeor${Number(p.wagaDocelowa)<Number(p.waga)?" z deficytem ~400 kcal":""})`:""}</div>
-      <input type="number" id="prof-limit" value="${p.limit??sug??""}"></label>
+      <input type="number" id="prof-limit" value="${window._limitDraft ?? p.limit ?? sug ?? ""}" oninput="window._limitTouched=true;window._limitDraft=this.value"></label>
     ${mode==="edit"?'<div class="hint" style="margin-bottom:12px">Zmiana limitu działa od bieżącego dnia. Historia zostaje bez zmian.</div>':""}
     <label><div class="lbl">Klucz API Gemini (aistudio.google.com → Get API key)</div>
       <input type="password" id="prof-key" value="${esc(S&&S.apiKey||"")}" placeholder="AIza..."></label>
     <button class="primary" style="width:100%" onclick="saveProfile('${mode}')">${mode==="edit"?"Zapisz zmiany":"Zaczynamy"}</button>`;
 }
 function setProf(k,v,mode){
-  const t = mode==="edit" ? S.profile : window._onb;
+  const t = mode==="edit" ? window._edit : window._onb;
   t[k] = (k==="plec") ? v : (v===""?"":Number(v));
+  if(!window._limitTouched){
+    const q = suggestLimit({...t, waga:Number(t.waga), wzrost:Number(t.wzrost), wiek:Number(t.wiek), wagaDocelowa:Number(t.wagaDocelowa)});
+    if(q) window._limitDraft = q;
+  }
   render();
 }
 function saveProfile(mode){
-  const t = mode==="edit" ? S.profile : window._onb;
+  const t = mode==="edit" ? window._edit : window._onb;
   const limit = Number($("prof-limit").value);
   const key = $("prof-key").value.trim();
   if(!t.wzrost||!t.waga||!t.wiek||!limit){ alert("Uzupełnij wzrost, wagę, wiek i limit."); return; }
   if(mode==="edit"){
     S.profile = {...S.profile, ...t, limit};
     S.apiKey = key;
+    window._edit = null;
   } else {
     const m = { date: todayStr(), waga:Number(t.waga) };
     ["biodra","brzuch","biceps"].forEach(k=>{
@@ -502,6 +616,7 @@ function saveProfile(mode){
     S = { profile:{...t, limit}, apiKey:key, currentDay:emptyDay(), history:[], measurements:[m] };
     window._onb = null;
   }
+  window._limitDraft = null; window._limitTouched = false;
   save(); view="dzisiaj"; render();
 }
 
@@ -516,6 +631,7 @@ function render(){
     return;
   }
   const tabs = [["dzisiaj","Dzisiaj"],["pomiary","Pomiary"],["historia","Historia"],["ustawienia","Ustawienia"]];
+  if(view!=="ustawienia"){ window._edit=null; window._limitDraft=null; window._limitTouched=false; }
   let body = "";
   if(view==="dzisiaj") body = todayHTML();
   else if(view==="pomiary") body = measurementsHTML();
